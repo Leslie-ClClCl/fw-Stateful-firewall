@@ -15,7 +15,9 @@
 #include <net/ip.h>
 #include <net/tcp.h>
 #include <net/udp.h>
+#include <net/icmp.h>
 #include <linux/udp.h>
+#include <linux/icmp.h>
 #include <linux/time.h>
 
 #define DEV_SZ 0x2000
@@ -31,9 +33,11 @@
 
 #define REFRESH_STAT    1
 #define SET_LOCAL_IP    2
-#define SET_PUB_IP      3
-#define TIME_OUT        4
-#define DEFAULT_STRATEGY 5
+#define SET_LOCAL_MASK  3
+#define SET_PUB_IP      4
+#define TIME_OUT        5
+#define DEFAULT_STRATEGY 6
+#define CLEAR_RULE      7
 
 #define DEFAULT_PERMIT 1
 #define DEFAULT_REJECT 0
@@ -53,6 +57,7 @@ dev_t devno;
 static struct nf_hook_ops nfho_out, nfho_in, nfho_nat;
 int defaultStrategy;
 
+unsigned char local_mask;
 unsigned int local_ip;
 unsigned int pub_ip;
 time_t ttl;
@@ -83,12 +88,19 @@ struct status {
     unsigned int daddr;
     unsigned int source;
     unsigned int dest;
-    // unsigned int seq;
-    // unsigned int ack;
-    // unsigned char stat;
     time_t last_t;
     struct status *next;
 } statList[bufSize];
+
+struct audit {
+    unsigned int saddr;
+    unsigned int daddr;
+    unsigned int source;
+    unsigned int dest;
+    time_t last_t;
+    unsigned char action;
+    struct audit *next;
+} Audit;
 
 struct nat {
     unsigned int ip_loc;
@@ -132,6 +144,10 @@ unsigned char getTCPflags(struct sk_buff *skb, unsigned char FLAG);
 int isLocalIP(unsigned int ip);
 void UpdateChecksum(struct sk_buff *skb);
 int needNAT(struct sk_buff *skb);
+unsigned short getICMPID(unsigned char type, unsigned char code);
+uint16_t GetChecksum (const void * const addr, const size_t bytes);
+void addAudit(__u32 saddr, __u32 daddr, __u32 source, __u32 dest, __u8 action, time_t t);
+
 // Associating function entry points
 static const struct file_operations fops = {
   .owner = THIS_MODULE,
@@ -184,14 +200,10 @@ ssize_t read(struct file * filp, char __user *buffer, size_t size, loff_t *offse
 }
 ssize_t write(struct file *filp, const char __user *buffer, size_t size, loff_t *offset) {
     // To write to the device
-    printk("Write begin~\n");
-    
     if (copy_from_user((unsigned char *)rules+rules_num*sizeof(struct rule), buffer, size)) {
         printk("Fail to copy from user\n");
         return 0;
     }
-    printk("Copy done!\n");
-    
     rules_num += size / sizeof(struct rule);
     return 1;
 }
@@ -214,17 +226,26 @@ long ioctl(struct file *filp, unsigned int cmd, unsigned long arg) {
         }
         return 0;
 	} else if (cmd == SET_LOCAL_IP) {
+        printk("local ip has changed to %d\n", arg);
         local_ip = arg;
+        return 0;
+    } else if (cmd == SET_LOCAL_MASK) {
+        printk("local mask has changed to %d\n", arg);
+        local_mask = arg;
         return 0;
     } else if (cmd == SET_PUB_IP) {
         printk("WAN has changed to %u\n", arg);
         pub_ip = arg;
         return 0;
     } else if (cmd == TIME_OUT) {
+        printk("timeout threshold has changed to %d\n", arg);
         ttl = arg;
     } else if (cmd == DEFAULT_STRATEGY) {
         defaultStrategy = arg;
-        printk("arg is %d. ds change to %d", arg, defaultStrategy);
+        printk("default strategy has changed to %s\n", arg, defaultStrategy==DEFAULT_PERMIT?"permit":"reject");
+    } else if (cmd == CLEAR_RULE) {
+        printk("Rule has been cleared\n");
+        rules_num = 0;
     }
 	return -EINVAL;
 }
@@ -270,6 +291,9 @@ int getQuintuple(struct sk_buff *skb, struct Quintuple *info) {
 }
 //
 unsigned char getTCPflags(struct sk_buff *skb, unsigned char FLAG) {
+    struct iphdr *iph = ip_hdr(skb);
+    if (iph->protocol != IPPROTO_TCP)
+        return 0;
     struct tcphdr *tcph = tcp_hdr(skb);
     unsigned char flag;
     if (tcph == NULL)
@@ -311,6 +335,8 @@ unsigned int regularMatcher(struct Quintuple *pkt_info) {
             continue;
         else if (rules[i].dest != pkt_info->dest && rules[i].dest != -1)
             continue;
+        else if (rules[i].protocol != pkt_info->protocol)
+            continue;
         if (rules[i].audit) {
             ((struct rule *)dev_mem)[audit_num].saddr = pkt_info->saddr;
             ((struct rule *)dev_mem)[audit_num].daddr = pkt_info->daddr;
@@ -326,15 +352,9 @@ unsigned int regularMatcher(struct Quintuple *pkt_info) {
 }
 //
 int isLocalIP(unsigned int ip) {
-    if (matchIPaddr(ip, 10, 8)) {
+    if (matchIPaddr(ip, local_ip, local_mask)) {
         return 1;
     }
-    if (matchIPaddr(ip, 4268, 16)){
-        return 1;
-    }
-    if (matchIPaddr(ip, 43200, 16)) {
-        return 1;
-    } 
     return 0;
 }
 //
@@ -349,7 +369,7 @@ void UpdateChecksum(struct sk_buff *skb) {
 
     if ( (ip_header->protocol == IPPROTO_TCP) || (ip_header->protocol == IPPROTO_UDP) ) {
         if(skb_is_nonlinear(skb))
-        skb_linearize(skb);  // very important.. You need this.
+            skb_linearize(skb);  // very important.. You need this.
 
         if (ip_header->protocol == IPPROTO_TCP) {
             struct tcphdr *tcpHdr;
@@ -370,13 +390,58 @@ void UpdateChecksum(struct sk_buff *skb) {
             udpHdr->check = 0;
             udpHdr->check = udp_v4_check(udplen,ip_header->saddr, ip_header->daddr,csum_partial((char *)udpHdr, udplen, 0));
         }
+    } else if (ip_header->protocol == IPPROTO_ICMP) {
+        struct icmphdr *icmph = icmp_hdr(skb);
+        skb->csum = 0;
+        unsigned int icmplen = ntohs(ip_header->tot_len) - ip_header->ihl*4;
+        icmph->checksum = 0;
+        icmph->checksum = GetChecksum(icmph, icmplen);
     }
 }
-///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//
+unsigned short getICMPID(unsigned char type, unsigned char code) {
+    unsigned short ret = 0;
+    ret = (type << 8) & code + 10246;
+    return ret;
+}
+//
+void addAudit(__u32 saddr, __u32 daddr, __u32 source, __u32 dest, __u8 action, time_t t) {
+    struct audit *newaudit = (struct audit*)kmalloc(sizeof(struct audit));
+    struct audit *head = &Audit;
+    newaudit->saddr = saddr;    newaudit->daddr = daddr;
+    newaudit->source = source;  newaudit->dest = dest;
+    newaudit->last_t = t;       newaudit->next = NULL;
 
-//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+    newaudit->next = head->next;
+    head->next = newaudit;
+    return;
+}
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+////////////////////////////////////////////////////////////////////////////////////////////
 //                          Net Filter Complement                       //
-//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+///////////////////////////////////////////////////////////////////////////////////////////
+uint16_t GetChecksum (const void * const addr, const size_t bytes) {
+    const uint16_t *word;
+    uint32_t sum;
+    uint16_t checksum;
+    size_t nleft;
+    word = (const uint16_t *)addr;
+    nleft = bytes;
+    /* 使用32 位累加器，顺序累加16 位数据，进位保存在高16 位 */
+    for (sum = 0; nleft > 1; nleft -=2) {
+        sum += *word;
+        ++word;
+    }
+    /* 如果总字节为奇数则处理最后一个字节 */
+    sum += nleft ? *(uint8_t *)word : 0;
+    /* 将进位加到低16 位，并将本次计算产生的进位再次加到低16 位 */
+    sum = (sum >> 16) + (sum & 0xffff);
+    sum += (sum >> 16);
+    /* 结果取反并截低16 位为校验和 */
+    return checksum = ~sum;
+}
+//
 void initStatHashTable(void) {
     int i = 0;
     for (i = 0; i < bufSize; i++) {
@@ -417,12 +482,12 @@ struct status *matchStatus(struct Quintuple *q) {
     struct status *head = statList[hashValue].next;
     while (head != NULL) {
         if (q->saddr == head->saddr && q->daddr == head->daddr && q->source == head->source && q->dest == head->dest) {
-            // printk("status list matched!\n");
+            return head;
+        } else if (q->saddr == head->daddr && q->daddr == head->saddr && q->source == head->dest && q->dest == head->source) {
             return head;
         }
         head = head->next;
     }
-    // printk("status list not matched!\n");
     return NULL;
 }
 //
@@ -453,10 +518,9 @@ void addStatus(struct Quintuple *q) {
     ptr->last_t = tv.tv_sec;
     ptr->next = NULL;
     
-    head = &statList[hashValue];
+    head = &statList[hashValue];    // op on the linkage list
     ptr->next = head->next;
     head->next = ptr;
-    printk("status has added to the list\n");
     return;
 }
 //
@@ -497,12 +561,12 @@ void delNat(struct nat *prev, struct nat *cur) {
     kfree(cur);
     return;
 }
-
+//
 void NATtransfer(struct sk_buff *skb) {
     struct iphdr *iph = ip_hdr(skb);
     if (iph->protocol == IPPROTO_TCP) {
         struct tcphdr *tcph = tcp_hdr(skb);
-        // TO DO UDP and ICMP
+        // TO DO ICMP
         if (isLocalIP(iph->saddr) && !isLocalIP(iph->daddr)) {
             // Out NAT
             // first, search the nat list
@@ -524,10 +588,46 @@ void NATtransfer(struct sk_buff *skb) {
                 tcph->dest = n->port_loc;
             }
         }
-        UpdateChecksum(skb);
+    } else if (iph->protocol == IPPROTO_UDP) {
+        struct udphdr *udph = udp_hdr(skb);
+        if (isLocalIP(iph->saddr) && !isLocalIP(iph->daddr)) {
+            struct nat *n = matchNat(iph->saddr, udph->source);
+            if (n != NULL) {    // if matched, then do the transfer
+                iph->saddr = n->ip_pub;
+                udph->source = n->port_pub;
+            } else {    // if not, random new a port and add it to the list
+                struct nat tmp = {iph->saddr, pub_ip, udph->source, udph->source+1024, NULL};
+                addNat(&tmp);
+                iph->saddr = pub_ip;
+                udph->source += 1024;
+            }
+        } else if (!isLocalIP(iph->saddr) && matchIPaddr(iph->daddr, pub_ip, 32)) {
+            struct nat *n = matchNat(iph->daddr, udph->dest);
+            if (n != NULL) {    // if matched, then do the transfer
+                iph->daddr = n->ip_loc;
+                udph->dest = n->port_loc;
+            }
+        } 
+    } else if (iph->protocol == IPPROTO_ICMP) {
+        struct icmphdr *icmph = icmp_hdr(skb);
+        if (isLocalIP(iph->saddr) && !isLocalIP(iph->daddr)) {
+            unsigned short newID = getICMPID(icmph->type, icmph->code);
+            struct nat tmp = {iph->saddr, pub_ip, icmph->un.echo.id, newID, NULL};
+            addNat(&tmp);
+            iph->saddr = pub_ip;
+            icmph->un.echo.id = newID;
+        } else if (!isLocalIP(iph->saddr) && matchIPaddr(iph->daddr, pub_ip, 32))  {
+            struct nat *n = matchNat(iph->daddr, icmph->un.echo.id);
+            if (n != NULL) {
+                iph->daddr = n->ip_loc;
+                icmph->un.echo.id = n->port_loc;
+            }
+        }
     }
+    UpdateChecksum(skb);
     return;
 }
+//
 //
 unsigned int net_forward(void *priv, struct sk_buff *skb, const struct nf_hook_state *state) {
     struct iphdr *iph = ip_hdr(skb);
@@ -542,27 +642,34 @@ unsigned int net_forward(void *priv, struct sk_buff *skb, const struct nf_hook_s
         // a demo for nat_filter
         struct Quintuple pkt_info;
         struct status *stat;
-        
         getQuintuple(skb, &pkt_info);
-
         stat = matchStatus(&pkt_info);
         if (stat != NULL) { // stat matched
             NATtransfer(skb);
             ret = NF_ACCEPT;
         } else {    // stat not matched
-            // the SYN packet?
-            if (getTCPflags(skb, SYN)) {
-                // matched rules list
+            if (iph->protocol == IPPROTO_TCP) {
+                // the SYN packet?
+                if (getTCPflags(skb, SYN)) {
+                    // matched rules list
+                    unsigned int action = regularMatcher(&pkt_info);
+                    // if permitted, add to the stat list
+                    if (action || defaultStrategy == DEFAULT_PERMIT) {
+                        addStatus(&pkt_info);
+                        NATtransfer(skb);
+                        ret = NF_ACCEPT;
+                    }
+                } else if (defaultStrategy == DEFAULT_PERMIT) {
+                    NATtransfer(skb);
+                    ret = NF_ACCEPT;
+                }
+            } else if (iph->protocol == IPPROTO_UDP || iph->protocol == IPPROTO_ICMP) {
                 unsigned int action = regularMatcher(&pkt_info);
-                // if permitted, add to the stat list
                 if (action || defaultStrategy == DEFAULT_PERMIT) {
                     addStatus(&pkt_info);
                     NATtransfer(skb);
                     ret = NF_ACCEPT;
                 }
-            } else if (defaultStrategy == DEFAULT_PERMIT) {
-                NATtransfer(skb);
-                ret = NF_ACCEPT;
             }
         }
     } else {
@@ -575,7 +682,6 @@ unsigned int net_pre_route(void *priv, struct sk_buff *skb, const struct nf_hook
     // a demo for net_filter
     unsigned int ret = NF_DROP;
     struct Quintuple pkt_info;
-    struct Quintuple tmp;
     struct status *stat;
     // info print
     struct iphdr *iph = ip_hdr(skb);
@@ -587,23 +693,19 @@ unsigned int net_pre_route(void *priv, struct sk_buff *skb, const struct nf_hook
     if (!isLocalIP(iph->saddr) && matchIPaddr(iph->daddr, pub_ip, 32)) {
         NATtransfer(skb);
         getQuintuple(skb, &pkt_info);
-        tmp.saddr = pkt_info.daddr;
-        tmp.source = pkt_info.dest;
-        tmp.daddr = pkt_info.saddr;
-        tmp.dest = pkt_info.source;
-        stat = matchStatus(&tmp);
+        stat = matchStatus(&pkt_info);
         if (stat != NULL) { // stat matched
             struct timeval tv;
             do_gettimeofday(&tv);
             stat->last_t = tv.tv_sec;
             ret = NF_ACCEPT;
         } else {    // stat not matched
+            unsigned int action = regularMatcher(&pkt_info);
             // the SYN packet?
             if (getTCPflags(skb, SYN)) {
-                unsigned int action = regularMatcher(&pkt_info);
                 // if permitted, add to the stat list
                 if (action || defaultStrategy == DEFAULT_PERMIT) {
-                    addStatus(&tmp);
+                    addStatus(&pkt_info);
                     ret = NF_ACCEPT;
                 } 
             } else if (defaultStrategy == DEFAULT_PERMIT) {
